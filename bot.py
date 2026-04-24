@@ -9,7 +9,8 @@ TOKEN = "8504103298:AAGfc9eLlj1yLghbeGqVD6v8c876OhyTUYE"
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-conn = sqlite3.connect("trip.db")
+# 🔥 ВАЖНО: БД в /tmp (иначе readonly ошибка)
+conn = sqlite3.connect("/tmp/trip.db")
 cur = conn.cursor()
 
 cur.execute("""
@@ -29,7 +30,6 @@ CREATE TABLE IF NOT EXISTS expenses (
 )
 """)
 
-# ПАРЫ
 cur.execute("""
 CREATE TABLE IF NOT EXISTS couples (
     chat_id INTEGER,
@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS couples (
 
 conn.commit()
 
+
+# ---------- UI ----------
 
 def menu():
     return ReplyKeyboardMarkup(
@@ -52,6 +54,8 @@ def menu():
         resize_keyboard=True
     )
 
+
+# ---------- HELPERS ----------
 
 def get_people(chat_id):
     cur.execute("SELECT name FROM participants WHERE chat_id = ?", (chat_id,))
@@ -69,12 +73,14 @@ def get_couples(chat_id):
     return cur.fetchall()
 
 
+# ---------- COMMANDS ----------
+
 @dp.message(Command("start"))
 async def start(message: types.Message):
     await message.answer(
-        "Добавь участников:\n/add Витя Дима Аня Катя\n\n"
-        "Добавь трату:\nВитя 2400 кафе\n\n"
-        "Создать пару:\n/couple Сережа Полина",
+        "Добавь участников:\n/add Витя Дима Аня\n\n"
+        "Добавь трату:\nВитя 1000 кафе\n\n"
+        "Пара:\n/couple Сережа Полина",
         reply_markup=menu()
     )
 
@@ -87,7 +93,7 @@ async def add_people(message: types.Message):
     for name in names:
         add_person(chat_id, name)
 
-    await message.answer("Участники добавлены.")
+    await message.answer("✅ Участники добавлены")
 
 
 @dp.message(Command("couple"))
@@ -107,7 +113,7 @@ async def add_couple(message: types.Message):
     cur.execute("INSERT INTO couples VALUES (?, ?, ?)", (chat_id, p1, p2))
     conn.commit()
 
-    await message.answer(f"❤️ Пара создана: {p1} + {p2}")
+    await message.answer(f"❤️ Пара: {p1} + {p2}")
 
 
 @dp.message(Command("total"))
@@ -121,9 +127,13 @@ async def total(message: types.Message):
     )
     rows = cur.fetchall()
 
+    if not rows:
+        await message.answer("Нет трат")
+        return
+
     balances = {p: 0.0 for p in people}
 
-    # СЧИТАЕМ ПО ЛЮДЯМ (ВАЖНО)
+    # считаем по людям
     for payer, amount, people_text in rows:
         selected = people_text.split(",")
         share = amount / len(selected)
@@ -132,7 +142,7 @@ async def total(message: types.Message):
         for person in selected:
             balances[person] -= share
 
-    # ОБЪЕДИНЯЕМ ПАРЫ
+    # объединяем пары
     couples = get_couples(chat_id)
 
     for p1, p2 in couples:
@@ -143,9 +153,8 @@ async def total(message: types.Message):
 
         balances[f"{p1}+{p2}"] = total_balance
 
-    # ДЕЛАЕМ ПЕРЕВОДЫ
-    debtors = []
-    creditors = []
+    # переводы
+    debtors, creditors = [], []
 
     for person, balance in balances.items():
         if balance < -0.01:
@@ -161,7 +170,6 @@ async def total(message: types.Message):
         c_name, c_amt = creditors[j]
 
         pay = min(d_amt, c_amt)
-
         transfers.append((d_name, c_name, pay))
 
         debtors[i][1] -= pay
@@ -172,29 +180,66 @@ async def total(message: types.Message):
         if creditors[j][1] < 0.01:
             j += 1
 
-    # ВЫВОД
-    text = "📊 Итог:\n\nБалансы:\n"
+    text = "📊 Итог:\n\n"
+
+    text += "Баланс:\n"
     for p, b in balances.items():
         sign = "+" if b > 0 else ""
         text += f"{p}: {sign}{b:.2f} ₽\n"
 
     text += "\n💸 Переводы:\n"
-    for d, c, a in transfers:
-        text += f"{d} → {c}: {a:.2f} ₽\n"
+    if not transfers:
+        text += "Никто никому не должен"
+    else:
+        for d, c, a in transfers:
+            text += f"{d} → {c}: {a:.2f} ₽\n"
 
     await message.answer(text)
 
 
+# ---------- TEXT HANDLER ----------
+
 @dp.message()
 async def handle_text(message: types.Message):
     chat_id = message.chat.id
-    text = message.text
+    text = message.text.strip()
+
+    # 🔥 КНОПКИ
+    if text == "➕ Добавить трату":
+        await message.answer("Пример:\nВитя 1000 кафе")
+        return
 
     if text == "📊 Итог":
         await total(message)
         return
 
-    # ДОБАВЛЕНИЕ ТРАТЫ
+    if text == "👥 Участники":
+        people = get_people(chat_id)
+        await message.answer("👥 " + ", ".join(people) if people else "Нет участников")
+        return
+
+    if text == "📋 Траты":
+        cur.execute("SELECT payer, amount, description FROM expenses WHERE chat_id = ?", (chat_id,))
+        rows = cur.fetchall()
+        if not rows:
+            await message.answer("Нет трат")
+        else:
+            text_out = ""
+            for r in rows:
+                text_out += f"{r[0]} — {r[1]} ₽ ({r[2]})\n"
+            await message.answer(text_out)
+        return
+
+    if text == "🧹 Очистить":
+        cur.execute("DELETE FROM participants WHERE chat_id = ?", (chat_id,))
+        cur.execute("DELETE FROM expenses WHERE chat_id = ?", (chat_id,))
+        cur.execute("DELETE FROM couples WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+        await message.answer("Очищено")
+        return
+
+    # ---------- ПАРСИНГ ТРАТЫ ----------
+
     if "|" in text:
         left, right = text.split("|", 1)
         selected = right.strip().split()
@@ -202,13 +247,19 @@ async def handle_text(message: types.Message):
         left = text
         selected = get_people(chat_id)
 
-    parts = left.strip().split()
+    parts = left.split()
 
     if len(parts) < 3:
         return
 
     payer = parts[0]
-    amount = float(parts[1])
+
+    try:
+        amount = float(parts[1].replace(",", "."))
+    except:
+        await message.answer("Ошибка суммы. Пример: Витя 1000 кафе")
+        return
+
     desc = " ".join(parts[2:])
 
     add_person(chat_id, payer)
@@ -222,8 +273,10 @@ async def handle_text(message: types.Message):
     )
     conn.commit()
 
-    await message.answer("✅ Трата добавлена")
+    await message.answer("✅ Добавлено")
 
+
+# ---------- RUN ----------
 
 async def main():
     await dp.start_polling(bot)
